@@ -1,6 +1,6 @@
 from typing import Dict
 
-from grouphug.heads.classification import ClassificationHead, ClassificationHeadConfig
+from grouphug.heads.classification import ClassificationHead, SequenceClassificationHead, ClassificationHeadConfig, SequenceClassificationHead, SequenceClassificationHeadConfig
 from grouphug.heads.lm import LMHeadConfig
 
 

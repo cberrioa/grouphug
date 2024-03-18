@@ -14,6 +14,7 @@ from .. import DatasetCollection
 from ..config import logger
 from ..dataset_collection import dataset_value_counts, is_iterable
 
+import numpy as np
 
 class ClassificationHead(ModelHead):
     SINGLE = "single_label_classification"
@@ -151,6 +152,67 @@ class ClassificationHead(ModelHead):
             loss = None
 
         return SequenceClassifierOutput(loss=loss, logits=logits)
+
+
+class SequenceClassificationHead(ClassificationHead):
+    def init_modules(self, input_dim, output_dim):
+          """Overwrite this method to change the architecture of the classification head"""
+          self.dropout_layer = nn.Dropout(self.dropout)
+          self.time_distributed_aggregate_feedforward = nn.Linear(input_dim, output_dim)
+
+    def forward(self, **kwargs):
+        if self.head_config.pooling_method == "auto":
+            self.head_config.pooling_method = "last" if self.config.is_decoder else "first"
+            logger.info(
+                f"Set pooling method to '{self.head_config.pooling_method}' for {self} based on config.is_decoder = {self.config.is_decoder}"
+            )
+
+        input_embedding = kwargs[f"{self.head_config.input_prefix}{INPUT_EMBEDDING_VAR}"]
+        input_embedding = input_embedding[0]
+        input_ids = kwargs["input_ids"]
+        index_sep = 2 # tokenizer.sep_token_id
+        sentences_mask = input_ids == index_sep # mask for all the SEP tokens in the batch
+        embedded_sentences = input_embedding[sentences_mask]  # given batch_size x num_sentences_per_example x sent_len x vector_len
+                                                                        # returns num_sentences_per_batch x vector_len
+        indx = np.arange(embedded_sentences.shape[0])
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sel_idx = torch.from_numpy(indx[indx%2==0]).to(device)
+        embedded_sentences = torch.index_select(embedded_sentences, 0, sel_idx)
+        batch_size = 1
+        embedded_sentences = embedded_sentences.unsqueeze(dim=0)
+        embedded_sentences = self.dropout_layer(embedded_sentences)
+        logits = self.time_distributed_aggregate_feedforward(embedded_sentences)
+
+        labels = kwargs.get(self.head_config.labels_var)
+        if labels is not None:
+            loss = self.loss(logits, labels)
+        else:
+            loss = None
+
+        return SequenceClassifierOutput(loss=loss, logits=logits)
+
+    def output_stats(self, output: SequenceClassifierOutput) -> Dict[str, Any]:
+        """Turns head output into a set of richer statistics"""
+        stats = super().output_stats(output)
+        if output.logits is not None:
+            logits = output.logits[0].detach().cpu()
+            np_logits = logits.numpy()
+            if self.problem_type == ClassificationHead.SINGLE:
+                stats["probs"] = torch.softmax(logits, dim=0).numpy()
+                stats["predicted_id"] = np_logits.argmax(-1)
+                if self.id2label is not None:
+                    stats["predicted_label"] = self.id2label[stats["predicted_id"]]
+            elif self.problem_type == ClassificationHead.MULTI:
+                stats["probs"] = torch.sigmoid(logits).numpy()
+                stats["predicted_ids"] = [i for i, p in enumerate(stats["probs"]) if p > 0.5]
+                if self.id2label is not None:
+                    stats["predicted_labels"] = [self.id2label[i] for i in stats["predicted_ids"]]
+            elif self.problem_type == ClassificationHead.REGRESSION:
+                if self.num_labels == 1:
+                    stats["predicted_value"] = np_logits[0]
+                else:
+                    stats["predicted_values"] = np_logits
+        return stats
 
 
 class ClassificationHeadConfig(HeadConfig):
@@ -325,7 +387,7 @@ class ClassificationHeadConfig(HeadConfig):
             np_logits = logits.numpy()
             if self.problem_type == ClassificationHead.SINGLE:
                 stats["probs"] = torch.softmax(logits, dim=0).numpy()
-                stats["predicted_id"] = np_logits.argmax()
+                stats["predicted_id"] = np_logits.argmax(-1)
                 if self.id2label is not None:
                     stats["predicted_label"] = self.id2label[stats["predicted_id"]]
             elif self.problem_type == ClassificationHead.MULTI:
@@ -339,6 +401,11 @@ class ClassificationHeadConfig(HeadConfig):
                 else:
                     stats["predicted_values"] = np_logits
         return stats
+
+
+class SequenceClassificationHeadConfig(ClassificationHeadConfig):
+  def create_head(self, config):
+        return SequenceClassificationHead(config, self)
 
 
 def get_classification_type(data: DatasetCollection, column: str, splits=("train", "test")) -> str:
